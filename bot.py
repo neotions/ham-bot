@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 import logging
 import os
+from pathlib import Path
+import sqlite3
 import xml.etree.ElementTree as ET
 
 import discord
@@ -23,7 +25,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 LOGGER = logging.getLogger("ham-bot")
-SOURCE_URL = "https://solar.w5mmw.net/"
+
+BOT_VERSION = "0.1"
+DB_VERSION = "0.1"
+SOLAR_XML_URL = "https://www.hamqsl.com/solarxml.php"
+DEFAULT_SOURCE_URL = "https://www.hamqsl.com/solar.html"
+DB_PATH = Path(os.getenv("HAM_BOT_DB_PATH", "ham_bot.sqlite3"))
 SPEED_OF_LIGHT_M_S = 299_792_458.0
 
 WAVELENGTH_UNITS = {
@@ -38,6 +45,81 @@ FREQUENCY_UNITS = {
     "MHz": ("MHz", 1_000_000.0),
     "GHz": ("GHz", 1_000_000_000.0),
 }
+
+
+def get_db_connection() -> sqlite3.Connection:
+    return sqlite3.connect(DB_PATH)
+
+
+def initialize_database() -> None:
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS solar_xml_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fetched_at_utc TEXT NOT NULL,
+                upstream_updated TEXT,
+                source_name TEXT,
+                source_url TEXT NOT NULL,
+                raw_xml TEXT NOT NULL,
+                db_version TEXT NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
+            (
+                ("db_version", DB_VERSION),
+                ("bot_version", BOT_VERSION),
+            ),
+        )
+
+
+def store_solar_xml(raw_xml: str, upstream_updated: str, source_name: str, source_url: str) -> None:
+    fetched_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO solar_xml_reports (
+                fetched_at_utc,
+                upstream_updated,
+                source_name,
+                source_url,
+                raw_xml,
+                db_version
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fetched_at_utc,
+                upstream_updated,
+                source_name,
+                source_url,
+                raw_xml,
+                DB_VERSION,
+            ),
+        )
+
+
+def clean_text(value: str | None, default: str = "N/A") -> str:
+    if value is None:
+        return default
+    cleaned = value.strip()
+    return cleaned or default
+
+
+def normalize_source_url(url: str | None) -> str:
+    cleaned = clean_text(url, DEFAULT_SOURCE_URL)
+    if cleaned.startswith("http://www.hamqsl.com/"):
+        return cleaned.replace("http://", "https://", 1)
+    return cleaned
 
 
 def format_updated_timestamp(raw_value: str) -> str:
@@ -84,60 +166,79 @@ def build_conversion_embed(
     )
     if extra_lines:
         embed.add_field(name="Also", value="\n".join(extra_lines), inline=False)
+    embed.set_footer(text=f"ham-bot {BOT_VERSION}")
     return embed
 
 
 def get_band_conditions() -> discord.Embed:
     """Fetch the current HF band conditions and build a Discord embed."""
-    response = requests.get("https://www.hamqsl.com/solarxml.php", timeout=10)
+    response = requests.get(SOLAR_XML_URL, timeout=10)
     response.raise_for_status()
 
-    root = ET.fromstring(response.text)
+    raw_xml = response.text
+    root = ET.fromstring(raw_xml)
     data = root.find("solardata")
     if data is None:
         raise ValueError("Solar data feed did not include a solardata element.")
 
-    sfi = data.findtext("solarflux", "N/A")
-    sunspots = data.findtext("sunspots", "N/A")
-    aindex = data.findtext("aindex", "N/A")
-    kindex = data.findtext("kindex", "N/A")
-    xray = data.findtext("xray", "N/A")
-    wind = data.findtext("solarwind", "N/A")
-    geomag = data.findtext("geomagfield", "N/A")
-    signal = data.findtext("signalnoise", "N/A")
-    updated = format_updated_timestamp(data.findtext("updated", "N/A"))
+    sfi = clean_text(data.findtext("solarflux"))
+    sunspots = clean_text(data.findtext("sunspots"))
+    aindex = clean_text(data.findtext("aindex"))
+    kindex = clean_text(data.findtext("kindex"))
+    xray = clean_text(data.findtext("xray"))
+    wind = clean_text(data.findtext("solarwind"))
+    geomag = clean_text(data.findtext("geomagfield"))
+    signal = clean_text(data.findtext("signalnoise"))
+    updated_raw = clean_text(data.findtext("updated"))
+    updated = format_updated_timestamp(updated_raw)
 
-    bands_day = {}
-    bands_night = {}
+    source = data.find("source")
+    source_name = clean_text(source.text if source is not None else None, "hamqsl")
+    source_url = normalize_source_url(source.get("url") if source is not None else None)
+
+    bands_day: dict[str, str] = {}
+    bands_night: dict[str, str] = {}
+    band_order: list[str] = []
     for band in data.findall("calculatedconditions/band"):
         name = band.get("name")
         if not name:
             continue
 
-        time_of_day = band.get("time")
-        condition = band.text or "N/A"
+        condition = clean_text(band.text)
+        time_of_day = clean_text(band.get("time"), "").lower()
+        if name not in band_order:
+            band_order.append(name)
+
         if time_of_day == "day":
             bands_day[name] = condition
-        else:
+        elif time_of_day == "night":
             bands_night[name] = condition
 
     def marker(condition: str) -> str:
-        return {"Good": "🟢", "Fair": "🟡", "Poor": "🔴"}.get(condition, "⚪")
+        return {"Good": "G", "Fair": "F", "Poor": "P"}.get(condition, "?")
+
+    store_solar_xml(
+        raw_xml=raw_xml,
+        upstream_updated=updated_raw,
+        source_name=source_name,
+        source_url=source_url,
+    )
 
     embed = discord.Embed(
-        title="📡 HF Band Conditions",
-        url=SOURCE_URL,
-        description=f"Data from [solar.w5mmw.net]({SOURCE_URL})\nUpdated: {updated}",
+        title="HF Band Conditions",
+        url=source_url,
+        description=f"Data from [{source_name}]({source_url})\nUpdated: {updated}",
         color=0x1A73E8,
     )
 
     band_lines = []
-    for band, day_condition in bands_day.items():
+    for band in band_order:
+        day_condition = bands_day.get(band, "N/A")
         night_condition = bands_night.get(band, "N/A")
         band_lines.append(
             f"**{band}**\n"
-            f"🌞 {marker(day_condition)} {day_condition}\n"
-            f"🌙 {marker(night_condition)} {night_condition}"
+            f"Day: {marker(day_condition)} {day_condition}\n"
+            f"Night: {marker(night_condition)} {night_condition}"
         )
 
     embed.add_field(
@@ -148,18 +249,18 @@ def get_band_conditions() -> discord.Embed:
     embed.add_field(
         name="Solar Data",
         value=(
-            f"☀️ Solar Flux: **{sfi}**\n"
-            f"🌑 Sunspots: **{sunspots}**\n"
-            f"🧲 Geomag: **{geomag}**\n\n"
-            f"📈 A-Index: **{aindex}**\n"
-            f"📊 K-Index: **{kindex}**\n"
-            f"☢️ X-Ray: **{xray}**\n\n"
-            f"💨 Solar Wind: **{wind} km/s**\n"
-            f"📶 Noise: **{signal}**"
+            f"Solar Flux: **{sfi}**\n"
+            f"Sunspots: **{sunspots}**\n"
+            f"Geomag: **{geomag}**\n\n"
+            f"A-Index: **{aindex}**\n"
+            f"K-Index: **{kindex}**\n"
+            f"X-Ray: **{xray}**\n\n"
+            f"Solar Wind: **{wind} km/s**\n"
+            f"Noise: **{signal}**"
         ),
         inline=False,
     )
-    embed.set_footer(text=f"Source: {SOURCE_URL}")
+    embed.set_footer(text=f"ham-bot {BOT_VERSION} | db {DB_VERSION} | XML archived in {DB_PATH.name}")
     return embed
 
 
@@ -171,6 +272,8 @@ class HamBot(commands.Bot):
         )
 
     async def setup_hook(self) -> None:
+        initialize_database()
+        LOGGER.info("Initialized SQLite database at %s.", DB_PATH.resolve())
         synced = await self.tree.sync()
         LOGGER.info("Synced %s global command(s).", len(synced))
 
@@ -227,7 +330,7 @@ async def wavelength_to_frequency(
     frequency_hz = SPEED_OF_LIGHT_M_S / wavelength_m
 
     embed = build_conversion_embed(
-        title="📶 Wavelength to Frequency",
+        title="Wavelength to Frequency",
         source_value=wavelength,
         source_unit=unit,
         result_value=frequency_hz / 1_000_000.0,
@@ -271,7 +374,7 @@ async def frequency_to_wavelength(
     wavelength_m = SPEED_OF_LIGHT_M_S / frequency_hz
 
     embed = build_conversion_embed(
-        title="📡 Frequency to Wavelength",
+        title="Frequency to Wavelength",
         source_value=frequency,
         source_unit=unit,
         result_value=wavelength_m,
